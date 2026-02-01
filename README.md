@@ -1,9 +1,11 @@
 # REDIS-charglt
+
 REDIS implementation of [Charglt](https://github.com/srmadscience/voltdb-charglt), but on MongoDB
 
-It Has the  basic functionality of charglt, but is missing stuff  - see TODO
+It Has the basic functionality of charglt, but is missing stuff - see TODO
+
 ## TODO
- 
+
 * Feed to downstream systems
 * Make scale - currently is sync and one thread
 * Running totals currently do a doc-by-doc scan instead of a single call.
