@@ -1,6 +1,6 @@
 # REDIS-charglt
 
-REDIS implementation of [Charglt](https://github.com/srmadscience/voltdb-charglt), but on MongoDB
+REDIS implementation of [Charglt](https://github.com/srmadscience/voltdb-charglt), but on REDIS
 
 It Has the basic functionality of charglt, but is missing stuff - see TODO
 
