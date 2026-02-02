@@ -18,15 +18,13 @@ package ie.rolfe.redischarglt;
 
 import com.google.gson.Gson;
 import ie.rolfe.redischarglt.documents.ExtraUserData;
-import redis.clients.jedis.HostAndPort;
-import redis.clients.jedis.RedisClusterClient;
+import redis.clients.jedis.JedisPooled;
 
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.Random;
-import java.util.Set;
 
 public class CreateChargingDemoData extends BaseChargingDemo {
+
 
     /**
      * @param args
@@ -45,6 +43,7 @@ public class CreateChargingDemoData extends BaseChargingDemo {
 
         // Comma delimited list of hosts...
         String hostlist = args[0];
+        String[] hosts = hostlist.split(",");
 
         // How many users
         int userCount = Integer.parseInt(args[1]);
@@ -62,20 +61,12 @@ public class CreateChargingDemoData extends BaseChargingDemo {
 
         try {
 
-            Set<HostAndPort> jedisClusterNodes = new HashSet<HostAndPort>();
-            for (int i = 0; i < hostlist.length(); i++) {
-                jedisClusterNodes.add(new HostAndPort(hostlist.split(",")[i], 7379));
+
+            try (JedisPooled jedisPool = new JedisPooled(hosts[0], REDIS_DEFAULT_PORT)) {
+                msg(jedisPool.ping());
+                upsertAllUsers(userCount, tpMs, ourJson, initialCredit, jedisPool, jedisPool);
             }
-
-            RedisClusterClient mainClient = RedisClusterClient.builder().nodes(jedisClusterNodes).build();
-            RedisClusterClient otherClient = RedisClusterClient.builder().nodes(jedisClusterNodes).build();
-
-
-            upsertAllUsers(userCount, tpMs, ourJson, initialCredit, mainClient, otherClient);
-
             msg("Closing connection...");
-            mainClient.close();
-            otherClient.close();
 
         } catch (Exception e) {
             msg(e.getMessage());

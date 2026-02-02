@@ -18,7 +18,8 @@ package ie.rolfe.redischarglt;
 
 import com.google.gson.Gson;
 import redis.clients.jedis.HostAndPort;
-import redis.clients.jedis.RedisClusterClient;
+import redis.clients.jedis.JedisPooled;
+
 
 import java.util.Arrays;
 import java.util.HashSet;
@@ -41,7 +42,7 @@ public class ChargingDemoKVStore extends BaseChargingDemo {
 
         // Comma delimited list of hosts...
         String hostlist = args[0];
-
+        String[] hosts = hostlist.split(",");
         // How many users
         int userCount = Integer.parseInt(args[1]);
 
@@ -62,21 +63,16 @@ public class ChargingDemoKVStore extends BaseChargingDemo {
         // Extra delay for testing really slow hardware
         int extraMs = getExtraMsIfSet();
 
+        boolean ok = true;
         try {
-            Set<HostAndPort> jedisClusterNodes = new HashSet<HostAndPort>();
-            for (int i = 0; i < hostlist.length(); i++) {
-                jedisClusterNodes.add(new HostAndPort(hostlist.split(",")[i], 7379));
+            try (JedisPooled jedisPool = new JedisPooled(hosts[0],REDIS_DEFAULT_PORT)) {
+                unlockAllRecords(jedisPool, userCount, new Gson());
+                 ok = runKVBenchmark(userCount, tpMs, durationSeconds, globalQueryFreqSeconds, jsonsize, jedisPool,
+                        deltaProportion, extraMs);
             }
 
-            RedisClusterClient mainClient = RedisClusterClient.builder().nodes(jedisClusterNodes).build();
-
-
-            unlockAllRecords(mainClient, userCount, new Gson());
-            boolean ok = runKVBenchmark(userCount, tpMs, durationSeconds, globalQueryFreqSeconds, jsonsize, mainClient,
-                    deltaProportion, extraMs);
 
             msg("Closing connection...");
-            mainClient.close();
 
             if (ok) {
                 System.exit(0);

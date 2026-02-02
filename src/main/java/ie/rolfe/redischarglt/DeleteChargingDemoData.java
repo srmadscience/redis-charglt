@@ -16,12 +16,9 @@
 package ie.rolfe.redischarglt;
 
 
-import redis.clients.jedis.HostAndPort;
-import redis.clients.jedis.RedisClusterClient;
+import redis.clients.jedis.JedisPooled;
 
 import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
 
 
 public class DeleteChargingDemoData extends BaseChargingDemo {
@@ -40,6 +37,7 @@ public class DeleteChargingDemoData extends BaseChargingDemo {
 
         // Comma delimited list of hosts...
         String hostlist = args[0];
+        String[] hosts = hostlist.split(",");
 
         // Target transactions per millisecond.
         int recordCount = Integer.parseInt(args[1]);
@@ -49,17 +47,13 @@ public class DeleteChargingDemoData extends BaseChargingDemo {
 
         try {
             try {
-                Set<HostAndPort> jedisClusterNodes = new HashSet<HostAndPort>();
-                for (int i = 0; i < hostlist.length(); i++) {
-                    jedisClusterNodes.add(new HostAndPort(hostlist.split(",")[i], 7379));
+
+
+                try (JedisPooled jedisPool = new JedisPooled(hosts[0],REDIS_DEFAULT_PORT)) {
+                    deleteAllUsers(jedisPool, recordCount, tpMs);
                 }
-
-                RedisClusterClient mainClient = RedisClusterClient.builder().nodes(jedisClusterNodes).build();
-
-                deleteAllUsers(mainClient, recordCount, tpMs);
-
                 msg("Closing connection...");
-                mainClient.close();
+
 
             } catch (Exception e) {
                 msg(e.getMessage());

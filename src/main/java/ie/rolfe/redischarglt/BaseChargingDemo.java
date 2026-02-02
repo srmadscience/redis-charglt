@@ -19,9 +19,11 @@ import com.google.gson.Gson;
 import ie.rolfe.redischarglt.documents.ExtraUserData;
 import ie.rolfe.redischarglt.documents.UserTable;
 import org.voltdb.voltutil.stats.SafeHistogramCache;
-import redis.clients.jedis.RedisClusterClient;
+import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.JedisPooled;
 
 import java.text.SimpleDateFormat;
+import java.time.Duration;
 import java.util.Date;
 import java.util.Random;
 
@@ -43,7 +45,7 @@ public abstract class BaseChargingDemo {
     public static final String ADD_DOC_ERROR = "Add Doc Error";
     public static final String UNABLE_TO_MEET_REQUESTED_TPS = "UNABLE_TO_MEET_REQUESTED_TPS";
     public static final String EXTRA_MS = "EXTRA_MS";
-    public static final int MONGO_DEFAULT_PORT = 27017;
+    protected static final int REDIS_DEFAULT_PORT = 6379;
     private static final String CHARGLT_DATABASE = "CHARGLT_DB";
     private static final String CHARGLT_USERS = "CHARGLT_USERS";
     private static final String ADD_CREDIT = "ADD_CREDIT";
@@ -93,7 +95,7 @@ public abstract class BaseChargingDemo {
     }
 
 
-    protected static void upsertAllUsers(int userCount, int tpMs, ExtraUserData ourEud, int initialCredit, RedisClusterClient redisClusterClient, RedisClusterClient otherClient)
+    protected static void upsertAllUsers(int userCount, int tpMs, ExtraUserData ourEud, int initialCredit, JedisPooled redisClient, JedisPooled otherClient)
             throws InterruptedException {
 
         final long startMsUpsert = System.currentTimeMillis();
@@ -123,7 +125,7 @@ public abstract class BaseChargingDemo {
 
             final long startMs = System.currentTimeMillis();
 
-            redisClusterClient.jsonSet(getKey(i), jsonObject);
+            redisClient.jsonSet(getKey(i), jsonObject);
             shc.reportLatency(BaseChargingDemo.ADD_DOC, startMs, "Add time", 2000);
             shc.incCounter(BaseChargingDemo.ADD_DOC);
 
@@ -134,7 +136,7 @@ public abstract class BaseChargingDemo {
                     msg("Errors detected. Halting...");
                     break;
                 } else {
-                    queryUserAndStats(g, redisClusterClient, i, userCount);
+                    queryUserAndStats(g, redisClient, i, userCount);
                 }
 
             }
@@ -152,7 +154,7 @@ public abstract class BaseChargingDemo {
     }
 
 
-    protected static void deleteAllUsers(RedisClusterClient redisClusterClient, int userCount, int tpMs) {
+    protected static void deleteAllUsers(JedisPooled redisClient, int userCount, int tpMs) {
 
         final long startMsUpsert = System.currentTimeMillis();
 
@@ -178,7 +180,7 @@ public abstract class BaseChargingDemo {
             }
 
             long startNs = System.currentTimeMillis();
-            long howMany = redisClusterClient.del(getKey(i));
+            long howMany = redisClient.del(getKey(i));
             shc.reportLatency(BaseChargingDemo.DELETE_DOC, startNs, "Delete time", 2000);
             if (howMany == 1) {
                 shc.incCounter(BaseChargingDemo.DELETE_DOC);
@@ -201,7 +203,7 @@ public abstract class BaseChargingDemo {
     /**
      * Convenience method to query a user a general stats and log the results
      */
-    protected static void queryUserAndStats(Gson g, RedisClusterClient redisClusterClient, int queryUserId, int userCount) {
+    protected static void queryUserAndStats(Gson g, JedisPooled redisClusterClient, int queryUserId, int userCount) {
 
         // Query user #queryUserId...
         msg("Query user #" + queryUserId + "...");
@@ -212,7 +214,7 @@ public abstract class BaseChargingDemo {
 
     }
 
-    private static void getCurrentReservedCredit(RedisClusterClient theClient, int userCount) {
+    private static void getCurrentReservedCredit(JedisPooled theClient, int userCount) {
 
         final long getDocByDocMs = System.currentTimeMillis();
 
@@ -240,9 +242,14 @@ public abstract class BaseChargingDemo {
         shc.reportLatency(BaseChargingDemo.COUNT_USAGE_TOTAL_BY_DOC, getDocByDocMs, "Time to count usage", 10000);
     }
 
-    private static UserTable getUser(Gson g, int queryUserId, RedisClusterClient theClient) {
+    private static UserTable getUser(Gson g, int queryUserId, JedisPooled theClient) {
         Object userDoc = theClient.jsonGet(getKey(queryUserId));
-        UserTable ut = UserTable.fromJson(g, (String) userDoc);
+        UserTable ut = null;
+        if (userDoc instanceof String) {
+            ut = UserTable.fromJson(g, (String) userDoc);
+        } else if (userDoc instanceof com.google.gson.internal.LinkedTreeMap) {
+            ut = UserTable.fromLTM(g, (com.google.gson.internal.LinkedTreeMap)userDoc);
+        }
 
         return ut;
 
@@ -276,7 +283,7 @@ public abstract class BaseChargingDemo {
      * @throws InterruptedException
      */
     protected static boolean runKVBenchmark(int userCount, int tpMs, int durationSeconds, int globalQueryFreqSeconds,
-                                            int jsonsize, RedisClusterClient mainClient, int deltaProportion, int extraMs)
+                                            int jsonsize, JedisPooled mainClient, int deltaProportion, int extraMs)
             throws InterruptedException {
 
         long lastGlobalQueryMs = 0;
@@ -424,7 +431,7 @@ public abstract class BaseChargingDemo {
         return tps / (tpMs * 1000) > .9;
     }
 
-    private static void GetAndLockUser(RedisClusterClient redisClusterClient, UserKVState userKVState, int sessionId, Gson gson) {
+    private static void GetAndLockUser(JedisPooled redisClusterClient, UserKVState userKVState, int sessionId, Gson gson) {
 
         final long startMs = System.currentTimeMillis();
         try {
@@ -445,7 +452,7 @@ public abstract class BaseChargingDemo {
 
     }
 
-    private static void UpdateLockedUser(RedisClusterClient redisClusterClient, UserKVState userKVState, long lockId, int sessionId, Object extraPayload, String deltaOperationName, Gson gson) {
+    private static void UpdateLockedUser(JedisPooled redisClusterClient, UserKVState userKVState, long lockId, int sessionId, Object extraPayload, String deltaOperationName, Gson gson) {
 
         final long startMs = System.currentTimeMillis();
 
@@ -497,7 +504,7 @@ public abstract class BaseChargingDemo {
      * credit.
      *
      */
-    protected static void clearUnfinishedTransactions(RedisClusterClient redisClusterClient, int usercount, Gson g)
+    protected static void clearUnfinishedTransactions(JedisPooled redisClusterClient, int usercount, Gson g)
             throws Exception {
 
         msg("clearUnfinishedTransactions...");
@@ -535,7 +542,7 @@ public abstract class BaseChargingDemo {
      *
      * @param redisClusterClient
      */
-    protected static void unlockAllRecords(RedisClusterClient redisClusterClient, int usercount, Gson g) {
+    protected static void unlockAllRecords(JedisPooled redisClusterClient, int usercount, Gson g) {
 
         msg("Clearing locked sessions from prior runs...");
         for (int id = 0; id < usercount; id++) {
@@ -585,7 +592,7 @@ public abstract class BaseChargingDemo {
      * @throws InterruptedException
      */
     protected static boolean runTransactionBenchmark(int userCount, int tpMs, int durationSeconds,
-                                                     int globalQueryFreqSeconds, RedisClusterClient mainClient, RedisClusterClient otherClient, int extraMs)
+                                                     int globalQueryFreqSeconds, JedisPooled mainClient, JedisPooled otherClient, int extraMs)
             throws InterruptedException {
 
         Gson g = new Gson();
@@ -709,7 +716,7 @@ public abstract class BaseChargingDemo {
     }
 
 
-    private static void addCredit(RedisClusterClient redisClusterClient, int sessionId, long extraCredit, Gson g) {
+    private static void addCredit(JedisPooled redisClusterClient, int sessionId, long extraCredit, Gson g) {
 
         final long startMs = System.currentTimeMillis();
         final String txnId = "AC" + startMs;
@@ -734,7 +741,7 @@ public abstract class BaseChargingDemo {
     }
 
 
-    private static void reportQuotaUsage(RedisClusterClient redisClusterClient
+    private static void reportQuotaUsage(JedisPooled redisClusterClient
             , int randomuser, int unitsUsed, int unitsWanted, long sessionId
             , String txnId, Gson gson, UserTransactionState userTransactionStateState) {
 
@@ -822,6 +829,22 @@ public abstract class BaseChargingDemo {
         }
 
         return extraMs;
+    }
+
+
+    private static JedisPoolConfig buildPoolConfig() {
+        final JedisPoolConfig poolConfig = new JedisPoolConfig();
+        poolConfig.setMaxTotal(128);
+        poolConfig.setMaxIdle(128);
+        poolConfig.setMinIdle(16);
+        poolConfig.setTestOnBorrow(true);
+        poolConfig.setTestOnReturn(true);
+        poolConfig.setTestWhileIdle(true);
+        poolConfig.setMinEvictableIdleTimeMillis(Duration.ofSeconds(60).toMillis());
+        poolConfig.setTimeBetweenEvictionRunsMillis(Duration.ofSeconds(30).toMillis());
+        poolConfig.setNumTestsPerEvictionRun(3);
+        poolConfig.setBlockWhenExhausted(true);
+        return poolConfig;
     }
 
 }

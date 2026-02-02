@@ -77,6 +77,22 @@ public class UserTable{
         return newUser;
     }
 
+    public static UserTable fromLTM(Gson g, com.google.gson.internal.LinkedTreeMap userDoc) {
+
+        UserTable ut = new UserTable();
+
+        ut._id = (long)((double) userDoc.get("_id"));
+        ut.userId = (long)((double) userDoc.get("userId"));
+        ut.userDataObject = new ExtraUserData();
+        String ulsString = userDoc.get("userLastSeen").toString();
+        ut.userLastSeen = new Date(0);
+        ut.userSoftLockSessionId = (long)((double) userDoc.get("userSoftLockSessionId"));
+        ut.userSoftlockExpiry = new Date(0);
+        ut.balance = (long)((double) userDoc.get("balance"));
+
+        return ut;
+    }
+
     public void setUserDataObject(ExtraUserData userDataObject) {
         this.userDataObject = userDataObject;
     }
