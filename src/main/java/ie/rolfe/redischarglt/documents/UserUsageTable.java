@@ -21,7 +21,7 @@ import java.util.Date;
  * ,primary key (userid, sessionid))
  * USING TTL 180 MINUTES ON COLUMN lastdate;
  */
-public class UserUsageTable extends AbstractBaseTable {
+public class UserUsageTable {
 
     public long userId;
     public long allocatedAmount;

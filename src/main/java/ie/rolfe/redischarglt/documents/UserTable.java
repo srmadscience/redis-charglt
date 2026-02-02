@@ -27,7 +27,7 @@ import java.util.Map;
  */
 
 
-public class UserTable extends AbstractBaseTable {
+public class UserTable{
 
     public static final long FIVE_MINUTES_IN_MS = 1000 * 60 * 5;
     public static final String ADDED_BY_TXN = " added by Txn ";

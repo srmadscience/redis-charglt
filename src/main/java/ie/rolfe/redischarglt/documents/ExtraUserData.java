@@ -21,7 +21,7 @@ import com.google.gson.Gson;
  * Class that gets stored as JSON data.
  *
  */
-public class ExtraUserData extends AbstractBaseTable {
+public class ExtraUserData  {
 
     public static final String NEW_LOYALTY_NUMBER = "NEW_LOYALTY_NUMBER";
 

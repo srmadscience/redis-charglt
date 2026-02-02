@@ -26,7 +26,7 @@ import java.util.Date;
  * ,primary key (userid, user_txn_id))
  * USING TTL 3600 SECONDS ON COLUMN txn_time BATCH_SIZE 200 MAX_FREQUENCY 1;
  */
-public class UserRecentTransactions extends AbstractBaseTable {
+public class UserRecentTransactions {
 
     public long userId;
     public String userTxnId;
@@ -52,7 +52,7 @@ public class UserRecentTransactions extends AbstractBaseTable {
     }
 
     public UserRecentTransactions(long userId, String txnId, int approvedAmount, long spentAmount, String purpose) {
-        super();
+
         this.userId = userId;
         this.userTxnId = txnId;
         this.approvedAmount = approvedAmount;
