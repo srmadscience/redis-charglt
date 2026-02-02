@@ -709,79 +709,56 @@ public abstract class BaseChargingDemo {
     }
 
 
-    private static void addCredit(RedisClusterClient redisClusterClient, int randomuser, long extraCredit, Gson g) {
+    private static void addCredit(RedisClusterClient redisClusterClient, int sessionId, long extraCredit, Gson g) {
 
-        MongoDatabase restaurantsDatabase = redisClusterClient.getDatabase(CHARGLT_DATABASE);
-        MongoCollection<Document> collection = restaurantsDatabase.getCollection(CHARGLT_USERS);
-        // Sets transaction options
-        TransactionOptions txnOptions = TransactionOptions.builder()
-                .writeConcern(WriteConcern.MAJORITY)
-                .build();
+        final long startMs = System.currentTimeMillis();
+        final String txnId = "AC" + startMs;
 
-        try (ClientSession session = redisClusterClient.startSession()) {
-            // Uses withTransaction and lambda for transaction operations
-            session.withTransaction(() -> {
-                Document userDoc = collection.find(eq(randomuser)).first();
-                if (userDoc != null) {
-                    collection.replaceOne(eq(randomuser), addCredit(userDoc, g, extraCredit));
-                }
-
-                return null; // Return value as expected by the lambda
-            }, txnOptions);
-
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        try {
+            UserTable ut = redisClusterClient.jsonGet(getKey(sessionId), UserTable.class);
+            if (ut == null) {
+                msg("User not found");
+            } else {
 
 
-    }
+                ut.addCredit(extraCredit, txnId);
 
+                redisClusterClient.jsonSet(getKey(sessionId), g.toJson(ut));
+                shc.reportLatency(BaseChargingDemo.KV_PUT, startMs, "KV Put time", 2000);
 
-    private static void reportQuotaUsage(RedisClusterClient mainClient, int randomuser, int unitsUsed, int unitsWanted, long sessionId, String txnId, Gson gson, UserTransactionState userTS) {
-
-        MongoDatabase restaurantsDatabase = mainClient.getDatabase(CHARGLT_DATABASE);
-        MongoCollection<Document> collection = restaurantsDatabase.getCollection(CHARGLT_USERS);
-
-        // Sets transaction options
-        TransactionOptions txnOptions = TransactionOptions.builder()
-                .writeConcern(WriteConcern.MAJORITY)
-                .build();
-
-        try (ClientSession session = mainClient.startSession()) {
-            // Uses withTransaction and lambda for transaction operations
-            session.withTransaction(() -> {
-                Document document = collection.find(eq(randomuser)).first();
-                if (document != null) {
-                    UserTable theUserTable = new UserTable(document);
-                    theUserTable.reportQuotaUsage(unitsUsed, unitsWanted, sessionId, txnId);
-                    String jsonObject = gson.toJson(theUserTable, UserTable.class);
-                    userTS.spendableBalance = theUserTable.getAvailableCredit();
-
-                    collection.replaceOne(eq(randomuser), Document.parse(jsonObject));
-
-                }
-
-                return null; // Return value as expected by the lambda
-            }, txnOptions);
+            }
 
         } catch (Exception e) {
             e.printStackTrace();
         }
-
-
     }
 
 
-    public static Document addCredit(Document document, Gson g, long amount) {
-
-        UserTable theUserTable = new UserTable(document);
-
-        theUserTable.addCredit(amount, "AddCredit_" + amount + "_" + System.currentTimeMillis());
-        String jsonObject = g.toJson(theUserTable, UserTable.class);
-        return (Document.parse(jsonObject));
+    private static void reportQuotaUsage(RedisClusterClient redisClusterClient
+            , int randomuser, int unitsUsed, int unitsWanted, long sessionId
+            , String txnId, Gson gson, UserTransactionState userTransactionStateState) {
 
 
+        final long startMs = System.currentTimeMillis();
+
+        try {
+            UserTable ut = redisClusterClient.jsonGet(getKey(randomuser), UserTable.class);
+            if (ut == null) {
+                msg("User not found");
+            } else {
+
+                ut.reportQuotaUsage(unitsUsed, unitsWanted, sessionId, txnId);
+                redisClusterClient.jsonSet(getKey((int) sessionId), gson.toJson(ut));
+                userTransactionStateState.endTran();
+                shc.reportLatency(BaseChargingDemo.KV_PUT, startMs, "KV Put time", 2000);
+
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
+
 
     /**
      * Turn latency stats into a grepable string
