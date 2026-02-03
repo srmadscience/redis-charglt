@@ -9,13 +9,18 @@
 package ie.rolfe.redischarglt.documents;
 
 import com.google.gson.Gson;
+import com.google.gson.internal.LinkedTreeMap;
 import ie.rolfe.redischarglt.ReferenceData;
 
 import java.security.SecureRandom;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
+
+import static ie.rolfe.redischarglt.BaseChargingDemo.msg;
 
 /**
  * CREATE table user_table
@@ -27,13 +32,14 @@ import java.util.Map;
  */
 
 
-public class UserTable{
+public class UserTable {
 
     public static final long FIVE_MINUTES_IN_MS = 1000 * 60 * 5;
     public static final String ADDED_BY_TXN = " added by Txn ";
     public static final String ALREADY_HAPPENED = " already happened";
     public static long TX_KEEP_MS = 300000;
-
+    public static final String GOOGLE_GSON_DATE_FORMAT = "MMM dd, yyyy, KK:mm:ss a"; // "Feb 3, 2026, 2:54:21"
+    static SimpleDateFormat sdf = new SimpleDateFormat(GOOGLE_GSON_DATE_FORMAT);
 
     public long _id;
 
@@ -43,7 +49,7 @@ public class UserTable{
     public long userSoftLockSessionId = Long.MIN_VALUE;
     public Date userSoftlockExpiry;
     public HashMap<Long, UserUsageTable> userUsage = new HashMap<Long, UserUsageTable>();
-    public HashMap<String, UserRecentTransactions> userRecentTransactions = new HashMap<String, UserRecentTransactions>();
+    public  HashMap<String, UserRecentTransactions> userRecentTransactions = new HashMap<String, UserRecentTransactions>();
     public long balance = 0;
 
     public UserTable(long userId, ExtraUserData userJsonObject, Date userLastSeen, Date userSoftlockExpiry, long userSoftLockSessionId) {
@@ -81,16 +87,51 @@ public class UserTable{
 
         UserTable ut = new UserTable();
 
-        ut._id = (long)((double) userDoc.get("_id"));
-        ut.userId = (long)((double) userDoc.get("userId"));
-        ut.userDataObject = new ExtraUserData();
-        String ulsString = userDoc.get("userLastSeen").toString();
-        ut.userLastSeen = new Date(0);
-        ut.userSoftLockSessionId = (long)((double) userDoc.get("userSoftLockSessionId"));
-        ut.userSoftlockExpiry = new Date(0);
-        ut.balance = (long)((double) userDoc.get("balance"));
+        ut._id = (long) ((double) userDoc.get("_id"));
+        ut.userId = (long) ((double) userDoc.get("userId"));
+
+        ExtraUserData eud = new ExtraUserData();
+        com.google.gson.internal.LinkedTreeMap eut = (LinkedTreeMap) userDoc.get("userDataObject");
+
+        eud.loyaltySchemeName = eut.get("loyaltySchemeName").toString();
+        eud.loyaltySchemeNumber = (long)((double)eut.get("loyaltySchemeNumber"));
+        eud.mysteriousHexPayload = eut.get("mysteriousHexPayload").toString();
+        ut.userDataObject = eud;
+
+        try {
+            ut.userLastSeen = getDateFromLTM(userDoc.get("userLastSeen"));
+
+        } catch (ParseException e) {
+            throw new RuntimeException(e);
+        }
+        ut.userSoftLockSessionId = (long) ((double) userDoc.get("userSoftLockSessionId"));
+        try {
+            ut.userSoftlockExpiry = getDateFromLTM(userDoc.get("userSoftlockExpiry"));
+        } catch (ParseException e) {
+            throw new RuntimeException(e);
+        }
+        ut.balance = (long) ((double) userDoc.get("balance"));
+
+        com.google.gson.internal.LinkedTreeMap urt = (LinkedTreeMap) userDoc.get("userRecentTransactions");
+        for (Object value : urt.values()) {
+            ut.userRecentTransactions.put((((LinkedTreeMap) value).get("userTxnId").toString())
+                    ,UserRecentTransactions.fromLTM(g,(LinkedTreeMap) value));
+        }
+        com.google.gson.internal.LinkedTreeMap uus = (LinkedTreeMap) userDoc.get("userUsage");
+        for (Object value : uus.values()) {
+            ut.userUsage.put((long)( (double) ((LinkedTreeMap) value).get("sessionId"))
+                    ,UserUsageTable.fromLTM(g,(LinkedTreeMap) value));
+        }
+
 
         return ut;
+    }
+
+    public static Date getDateFromLTM(Object userDoc) throws ParseException {
+        if (userDoc == null) {
+            return null;
+        }
+        return sdf.parse(userDoc.toString().replace("PM", "p.m.").replace("AM", "a.m."));
     }
 
     public void setUserDataObject(ExtraUserData userDataObject) {

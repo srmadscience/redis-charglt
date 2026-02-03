@@ -16,12 +16,14 @@
 package ie.rolfe.redischarglt;
 
 import com.google.gson.Gson;
+import com.google.gson.internal.LinkedTreeMap;
 import ie.rolfe.redischarglt.documents.ExtraUserData;
 import ie.rolfe.redischarglt.documents.UserTable;
 import org.voltdb.voltutil.stats.SafeHistogramCache;
 import redis.clients.jedis.JedisPoolConfig;
 import redis.clients.jedis.JedisPooled;
 
+import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.time.Duration;
 import java.util.Date;
@@ -225,8 +227,8 @@ public abstract class BaseChargingDemo {
 
         for (int i = 0; i < userCount; i++) {
 
-            Object userDoc = theClient.jsonGet(getKey(i));
-            UserTable ut = UserTable.fromJson(g, (String) userDoc);
+            LinkedTreeMap userDoc = (LinkedTreeMap) theClient.jsonGet(getKey(i));
+            UserTable ut = UserTable.fromLTM(g, userDoc);
             total += ut.getUsageBalance();
 
             if (i % 100000 == 1) {

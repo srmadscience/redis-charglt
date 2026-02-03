@@ -9,7 +9,9 @@
 package ie.rolfe.redischarglt.documents;
 
 import com.google.gson.Gson;
+import com.google.gson.internal.LinkedTreeMap;
 
+import java.text.ParseException;
 import java.util.Date;
 
 /**
@@ -29,6 +31,8 @@ public class UserUsageTable {
     public Date lastDate;
 
 
+    public UserUsageTable() {}
+
     public UserUsageTable(long userId, long allocatedAmount, long sessionId, Date lastDate) {
         this.userId = userId;
         this.allocatedAmount = allocatedAmount;
@@ -38,6 +42,25 @@ public class UserUsageTable {
 
     public static UserUsageTable fromJson(Gson gson, String document) {
         return new Gson().fromJson(document, UserUsageTable.class);
+    }
+
+    public static UserUsageTable fromLTM(Gson g, LinkedTreeMap value) {
+
+        UserUsageTable urt = new UserUsageTable();
+
+        urt.userId = (long) ((double)  value.get("userId"));
+        urt.allocatedAmount = (long) ((double) value.get("allocatedAmount"));
+       urt.sessionId = (long) ((double) value.get("sessionId"));
+
+        try {
+            urt.lastDate = UserTable.getDateFromLTM(value.get("lastDate"));
+
+        } catch (ParseException e) {
+            throw new RuntimeException(e);
+        }
+
+
+        return urt;
     }
 
 
