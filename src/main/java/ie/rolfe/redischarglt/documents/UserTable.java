@@ -49,7 +49,7 @@ public class UserTable {
     public long userSoftLockSessionId = Long.MIN_VALUE;
     public Date userSoftlockExpiry;
     public HashMap<Long, UserUsageTable> userUsage = new HashMap<Long, UserUsageTable>();
-    public  HashMap<String, UserRecentTransactions> userRecentTransactions = new HashMap<String, UserRecentTransactions>();
+    public HashMap<String, UserRecentTransactions> userRecentTransactions = new HashMap<String, UserRecentTransactions>();
     public long balance = 0;
 
     public UserTable(long userId, ExtraUserData userJsonObject, Date userLastSeen, Date userSoftlockExpiry, long userSoftLockSessionId) {
@@ -94,7 +94,7 @@ public class UserTable {
         com.google.gson.internal.LinkedTreeMap eut = (LinkedTreeMap) userDoc.get("userDataObject");
 
         eud.loyaltySchemeName = eut.get("loyaltySchemeName").toString();
-        eud.loyaltySchemeNumber = (long)((double)eut.get("loyaltySchemeNumber"));
+        eud.loyaltySchemeNumber = (long) ((double) eut.get("loyaltySchemeNumber"));
         eud.mysteriousHexPayload = eut.get("mysteriousHexPayload").toString();
         ut.userDataObject = eud;
 
@@ -115,12 +115,12 @@ public class UserTable {
         com.google.gson.internal.LinkedTreeMap urt = (LinkedTreeMap) userDoc.get("userRecentTransactions");
         for (Object value : urt.values()) {
             ut.userRecentTransactions.put((((LinkedTreeMap) value).get("userTxnId").toString())
-                    ,UserRecentTransactions.fromLTM(g,(LinkedTreeMap) value));
+                    , UserRecentTransactions.fromLTM(g, (LinkedTreeMap) value));
         }
         com.google.gson.internal.LinkedTreeMap uus = (LinkedTreeMap) userDoc.get("userUsage");
         for (Object value : uus.values()) {
-            ut.userUsage.put((long)( (double) ((LinkedTreeMap) value).get("sessionId"))
-                    ,UserUsageTable.fromLTM(g,(LinkedTreeMap) value));
+            ut.userUsage.put((long) ((double) ((LinkedTreeMap) value).get("sessionId"))
+                    , UserUsageTable.fromLTM(g, (LinkedTreeMap) value));
         }
 
 

@@ -72,11 +72,11 @@ public class UserRecentTransactions {
         UserRecentTransactions urt = new UserRecentTransactions();
 
         urt.userTxnId = (String) userDoc.get("userTxnId");
-        urt.userId = (long) ((double)  userDoc.get("userId"));
+        urt.userId = (long) ((double) userDoc.get("userId"));
         urt.approvedAmount = (long) ((double) userDoc.get("approvedAmount"));
         urt.purpose = (String) userDoc.get("purpose");
         urt.sessionId = (long) ((double) userDoc.get("sessionId"));
-        urt.spentAmount = (long) ((double)  userDoc.get("spentAmount"));
+        urt.spentAmount = (long) ((double) userDoc.get("spentAmount"));
         try {
             urt.txnTime = UserTable.getDateFromLTM(userDoc.get("txnTime"));
 

@@ -23,7 +23,6 @@ import org.voltdb.voltutil.stats.SafeHistogramCache;
 import redis.clients.jedis.JedisPoolConfig;
 import redis.clients.jedis.JedisPooled;
 
-import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.time.Duration;
 import java.util.Date;
@@ -250,7 +249,7 @@ public abstract class BaseChargingDemo {
         if (userDoc instanceof String) {
             ut = UserTable.fromJson(g, (String) userDoc);
         } else if (userDoc instanceof com.google.gson.internal.LinkedTreeMap) {
-            ut = UserTable.fromLTM(g, (com.google.gson.internal.LinkedTreeMap)userDoc);
+            ut = UserTable.fromLTM(g, (com.google.gson.internal.LinkedTreeMap) userDoc);
         }
 
         return ut;
