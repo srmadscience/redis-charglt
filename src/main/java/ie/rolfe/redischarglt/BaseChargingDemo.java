@@ -227,8 +227,9 @@ public abstract class BaseChargingDemo {
         for (int i = 0; i < userCount; i++) {
 
             LinkedTreeMap userDoc = (LinkedTreeMap) theClient.jsonGet(getKey(i));
-            UserTable ut = UserTable.fromLTM(g, userDoc);
-            total += ut.getUsageBalance();
+            if (userDoc != null) { UserTable ut = UserTable.fromLTM(g, userDoc);
+                total += ut.getUsageBalance();}
+
 
             if (i % 100000 == 1) {
                 msg("Queried " + i + " users. Total is " + total);
