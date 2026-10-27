@@ -40,6 +40,8 @@ Documents written by versions before epoch ms dates can't be read - delete and r
 * [mongodb-charglt](https://github.com/srmadscience/mongodb-charglt)
 * [s2-charglt](https://github.com/srmadscience/s2-charglt)
 * [voltdb-charglt](https://github.com/srmadscience/voltdb-charglt)
+* [oracle-charglt](https://github.com/srmadscience/oracle-charglt)
+* [postgres-charglt](https://github.com/srmadscience/postgres-charglt)
 
 ## TODO
 
