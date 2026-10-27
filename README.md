@@ -6,6 +6,7 @@ It Has the basic functionality of charglt, but is missing stuff - see TODO
 
 ## See Also:
 
+* [aerospike-charglt](https://github.com/srmadscience/aerospike-charglt)
 * [mongodb-charglt](https://github.com/srmadscience/mongodb-charglt)
 * [s2-charglt](https://github.com/srmadscience/s2-charglt)
 * [voltdb-charglt](https://github.com/srmadscience/voltdb-charglt)
