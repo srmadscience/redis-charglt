@@ -36,8 +36,8 @@ public class CreateChargingDemoData extends BaseChargingDemo {
 
         msg("Parameters:" + Arrays.toString(args));
 
-        if (args.length != 4) {
-            msg("Usage: hostnames recordcount tpms  maxinitialcredit  ");
+        if (args.length != 4 && args.length != 5) {
+            msg("Usage: hostnames recordcount tpms  maxinitialcredit [threads]");
             System.exit(1);
         }
 
@@ -51,6 +51,9 @@ public class CreateChargingDemoData extends BaseChargingDemo {
         // Target transactions per millisecond.
         int tpMs = Integer.parseInt(args[2]);
 
+        // How many threads. Defaults to the number of CPUs.
+        int threadCount = getThreadCount(args, 4);
+
         // How long our arbitrary JSON payload will be.
         int loblength = 120;
         final ExtraUserData ourJson = getExtraUserDataAsObject(loblength, gson, r);
@@ -62,9 +65,9 @@ public class CreateChargingDemoData extends BaseChargingDemo {
         try {
 
 
-            try (JedisPooled jedisPool = new JedisPooled(hosts[0], REDIS_DEFAULT_PORT)) {
+            try (JedisPooled jedisPool = connect(hosts[0], threadCount)) {
                 msg(jedisPool.ping());
-                upsertAllUsers(userCount, tpMs, ourJson, initialCredit, jedisPool, jedisPool);
+                upsertAllUsers(userCount, tpMs, ourJson, initialCredit, jedisPool, threadCount, getExtraMsIfSet());
             }
             msg("Closing connection...");
 

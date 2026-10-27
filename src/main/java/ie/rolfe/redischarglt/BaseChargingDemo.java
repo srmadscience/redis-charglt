@@ -16,17 +16,32 @@
 package ie.rolfe.redischarglt;
 
 import com.google.gson.Gson;
-import com.google.gson.internal.LinkedTreeMap;
 import ie.rolfe.redischarglt.documents.ExtraUserData;
 import ie.rolfe.redischarglt.documents.UserTable;
+import ie.rolfe.redischarglt.documents.UserUsageTable;
 import org.voltdb.voltutil.stats.SafeHistogramCache;
-import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.AbstractTransaction;
+import redis.clients.jedis.ConnectionPoolConfig;
 import redis.clients.jedis.JedisPooled;
+import redis.clients.jedis.json.Path;
+import redis.clients.jedis.json.Path2;
 
 import java.text.SimpleDateFormat;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Random;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.IntFunction;
+import java.util.function.Predicate;
 
 /**
  * This is an abstract class that contains the actual logic of the demo code.
@@ -47,12 +62,14 @@ public abstract class BaseChargingDemo {
     public static final String UNABLE_TO_MEET_REQUESTED_TPS = "UNABLE_TO_MEET_REQUESTED_TPS";
     public static final String EXTRA_MS = "EXTRA_MS";
     protected static final int REDIS_DEFAULT_PORT = 6379;
-    private static final String CHARGLT_DATABASE = "CHARGLT_DB";
     private static final String CHARGLT_USERS = "CHARGLT_USERS";
     private static final String ADD_CREDIT = "ADD_CREDIT";
     private static final String CLEAR_LOCK = "CLEAR_LOCK";
     private static final String CLEAR_UNFINISHED = "CLEAR_UNFINISHED";
     private static final String COUNT_USAGE_TOTAL_BY_DOC = "COUNT_USAGE_TOTAL_BY_DOC";
+    private static final String WATCH_CONFLICT = "WATCH_CONFLICT";
+    private static final String USER_NOT_FOUND = "USER_NOT_FOUND";
+    private static final int MAX_WATCH_RETRIES = 10;
     public static SafeHistogramCache shc = SafeHistogramCache.getInstance();
 
     /**
@@ -68,6 +85,18 @@ public abstract class BaseChargingDemo {
         String strDate = sdfDate.format(now);
         System.out.println(strDate + ":" + message);
 
+    }
+
+    /**
+     * Connect to REDIS.
+     *
+     * @param host        REDIS host
+     * @param threadCount how many threads will share the connection pool
+     * @return a pooled, thread safe client
+     */
+    protected static JedisPooled connect(String host, int threadCount) {
+        msg("Connecting to REDIS at " + host + ":" + REDIS_DEFAULT_PORT);
+        return new JedisPooled(buildPoolConfig(threadCount), host, REDIS_DEFAULT_PORT);
     }
 
 
@@ -96,106 +125,107 @@ public abstract class BaseChargingDemo {
     }
 
 
-    protected static void upsertAllUsers(int userCount, int tpMs, ExtraUserData ourEud, int initialCredit, JedisPooled redisClient, JedisPooled otherClient)
+    protected static void upsertAllUsers(int userCount, int tpMs, ExtraUserData ourEud, int initialCredit,
+                                         JedisPooled redisClient, int threadCount, int extraMs)
             throws InterruptedException {
 
         final long startMsUpsert = System.currentTimeMillis();
+        final int usableThreadCount = getUsableThreadCount(threadCount, tpMs, userCount);
+        final AtomicLong upsertCount = new AtomicLong();
 
-        SafeHistogramCache shc = SafeHistogramCache.getInstance();
-        long currentMs = System.currentTimeMillis();
-        int tpThisMs = 0;
-        Random r = new Random();
-        Gson g = new Gson();
+        msg("Upserting " + userCount + " users using " + usableThreadCount + " threads");
 
-        for (int i = 0; i < userCount; i++) {
+        runInThreads(usableThreadCount, threadId -> () -> {
 
-            if (tpThisMs++ > tpMs) {
+            TpMsThrottle throttle = new TpMsThrottle(getThreadTpMs(tpMs, usableThreadCount, threadId), extraMs);
+            Random r = new Random();
 
-                while (currentMs == System.currentTimeMillis()) {
-                    Thread.sleep(0, 50000);
+            for (int i = threadId; i < userCount; i += usableThreadCount) {
+
+                throttle.await();
+
+                UserTable newUser = UserTable.getUserTable(ourEud, r.nextInt(initialCredit), i, startMsUpsert);
+                newUser.addCredit(100, "Txn_" + i);
+                newUser.reportQuotaUsage(100, 10, 100, "TX2_" + i);
+
+                final long startMs = System.currentTimeMillis();
+
+                try {
+                    redisClient.jsonSet(getKey(i), Path2.ROOT_PATH, newUser.toJson());
+                    shc.reportLatency(BaseChargingDemo.ADD_DOC, startMs, "Add time", 2000);
+                    shc.incCounter(BaseChargingDemo.ADD_DOC);
+                } catch (Exception e) {
+                    msg("Upsert of user " + i + " failed: " + e.getMessage());
+                    shc.incCounter(BaseChargingDemo.ADD_DOC_ERROR);
                 }
 
-                currentMs = System.currentTimeMillis();
-                tpThisMs = 0;
-            }
+                long upserted = upsertCount.incrementAndGet();
 
-            UserTable newUser = UserTable.getUserTable(ourEud, r.nextInt(initialCredit), i, startMsUpsert);
-            newUser.addCredit(100, "Txn_" + i);
-            newUser.reportQuotaUsage(100, 10, 100, "TX2_" + i);
-            String jsonObject = g.toJson(newUser, UserTable.class);
+                if (upserted % 100000 == 1) {
+                    msg("Upserted " + upserted + " users...");
 
-            final long startMs = System.currentTimeMillis();
+                    if (shc.getCounter(BaseChargingDemo.ADD_DOC_ERROR) > 0) {
+                        msg("Errors detected. Halting...");
+                        break;
+                    } else if (threadId == 0) {
+                        queryUserAndStats(redisClient, i, userCount);
+                    }
 
-            redisClient.jsonSet(getKey(i), jsonObject);
-            shc.reportLatency(BaseChargingDemo.ADD_DOC, startMs, "Add time", 2000);
-            shc.incCounter(BaseChargingDemo.ADD_DOC);
-
-            if (i % 100000 == 1) {
-                msg("Upserted " + i + " users...");
-
-                if (shc.getCounter(BaseChargingDemo.ADD_DOC_ERROR) > 0) {
-                    msg("Errors detected. Halting...");
-                    break;
-                } else {
-                    queryUserAndStats(g, redisClient, i, userCount);
                 }
 
             }
 
-        }
+            return null;
+        });
 
 
-        long entriesPerMS = userCount / (System.currentTimeMillis() - startMsUpsert);
+        long entriesPerMS = userCount / Math.max(1, System.currentTimeMillis() - startMsUpsert);
         msg("Upserted " + entriesPerMS + " users per ms...");
         msg(shc.toString());
     }
 
-    private static String getKey(int i) {
+    private static String getKey(long i) {
         return CHARGLT_USERS + ":" + i;
     }
 
 
-    protected static void deleteAllUsers(JedisPooled redisClient, int userCount, int tpMs) {
+    protected static void deleteAllUsers(JedisPooled redisClient, int userCount, int tpMs, int threadCount,
+                                         int extraMs) throws InterruptedException {
 
         final long startMsUpsert = System.currentTimeMillis();
+        final int usableThreadCount = getUsableThreadCount(threadCount, tpMs, userCount);
+        final AtomicLong deleteCount = new AtomicLong();
 
-        SafeHistogramCache shc = SafeHistogramCache.getInstance();
-        long currentMs = System.currentTimeMillis();
-        int tpThisMs = 0;
+        msg("Deleting " + userCount + " users using " + usableThreadCount + " threads");
 
+        runInThreads(usableThreadCount, threadId -> () -> {
 
-        for (int i = 0; i < userCount; i++) {
+            TpMsThrottle throttle = new TpMsThrottle(getThreadTpMs(tpMs, usableThreadCount, threadId), extraMs);
 
-            if (tpThisMs++ > tpMs) {
+            for (int i = threadId; i < userCount; i += usableThreadCount) {
 
-                while (currentMs == System.currentTimeMillis()) {
-                    try {
-                        Thread.sleep(0, 50000);
-                    } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
+                throttle.await();
+
+                long startNs = System.currentTimeMillis();
+                long howMany = redisClient.del(getKey(i));
+                shc.reportLatency(BaseChargingDemo.DELETE_DOC, startNs, "Delete time", 2000);
+                if (howMany == 1) {
+                    shc.incCounter(BaseChargingDemo.DELETE_DOC);
+                } else {
+                    shc.incCounter(BaseChargingDemo.DELETE_DOC_ERROR);
                 }
 
-                currentMs = System.currentTimeMillis();
-                tpThisMs = 0;
+                long deleted = deleteCount.incrementAndGet();
+                if (deleted % 100000 == 1) {
+                    msg("Deleted " + deleted + " users...");
+                }
+
             }
 
-            long startNs = System.currentTimeMillis();
-            long howMany = redisClient.del(getKey(i));
-            shc.reportLatency(BaseChargingDemo.DELETE_DOC, startNs, "Delete time", 2000);
-            if (howMany == 1) {
-                shc.incCounter(BaseChargingDemo.DELETE_DOC);
-            } else {
-                shc.incCounter(BaseChargingDemo.DELETE_DOC_ERROR);
-            }
+            return null;
+        });
 
-            if (i % 100000 == 1) {
-                msg("Deleted " + i + " users...");
-            }
-
-        }
-
-        long entriesPerMS = userCount / (System.currentTimeMillis() - startMsUpsert);
+        long entriesPerMS = userCount / Math.max(1, System.currentTimeMillis() - startMsUpsert);
         msg("Deleted " + entriesPerMS + " users per ms...");
         msg(shc.toString());
 
@@ -204,14 +234,14 @@ public abstract class BaseChargingDemo {
     /**
      * Convenience method to query a user a general stats and log the results
      */
-    protected static void queryUserAndStats(Gson g, JedisPooled redisClusterClient, int queryUserId, int userCount) {
+    protected static void queryUserAndStats(JedisPooled redisClient, int queryUserId, int userCount) {
 
         // Query user #queryUserId...
         msg("Query user #" + queryUserId + "...");
-        UserTable ut = getUser(g, queryUserId, redisClusterClient);
+        UserTable ut = getUser(redisClient, queryUserId);
         reportDocument(ut);
         msg("Show amount of credit currently reserved for products...");
-        getCurrentReservedCredit(redisClusterClient, userCount);
+        getCurrentReservedCredit(redisClient, userCount);
 
     }
 
@@ -219,16 +249,14 @@ public abstract class BaseChargingDemo {
 
         final long getDocByDocMs = System.currentTimeMillis();
 
-        SafeHistogramCache shc = SafeHistogramCache.getInstance();
-        Random r = new Random();
-        Gson g = new Gson();
         long total = 0;
 
         for (int i = 0; i < userCount; i++) {
 
-            LinkedTreeMap userDoc = (LinkedTreeMap) theClient.jsonGet(getKey(i));
-            if (userDoc != null) { UserTable ut = UserTable.fromLTM(g, userDoc);
-                total += ut.getUsageBalance();}
+            UserTable ut = getUser(theClient, i);
+            if (ut != null) {
+                total += ut.getUsageBalance();
+            }
 
 
             if (i % 100000 == 1) {
@@ -244,17 +272,58 @@ public abstract class BaseChargingDemo {
         shc.reportLatency(BaseChargingDemo.COUNT_USAGE_TOTAL_BY_DOC, getDocByDocMs, "Time to count usage", 10000);
     }
 
-    private static UserTable getUser(Gson g, int queryUserId, JedisPooled theClient) {
-        Object userDoc = theClient.jsonGet(getKey(queryUserId));
-        UserTable ut = null;
-        if (userDoc instanceof String) {
-            ut = UserTable.fromJson(g, (String) userDoc);
-        } else if (userDoc instanceof com.google.gson.internal.LinkedTreeMap) {
-            ut = UserTable.fromLTM(g, (com.google.gson.internal.LinkedTreeMap) userDoc);
+    private static UserTable getUser(JedisPooled theClient, long queryUserId) {
+        return UserTable.fromJson(theClient.jsonGetAsPlainString(getKey(queryUserId), Path.ROOT_PATH));
+    }
+
+    /**
+     * Read a user, change it, and write it back only if nobody else changed it in the meantime.
+     * WATCH makes EXEC fail if the key changes after we start looking at it, in which case we
+     * re-read and retry.
+     *
+     * @param redisClient
+     * @param userId
+     * @param change      changes the UserTable and returns true if it needs to be written
+     * @return the UserTable as written, or null if the user doesn't exist
+     */
+    private static UserTable readModifyWrite(JedisPooled redisClient, long userId, Predicate<UserTable> change) {
+
+        final String key = getKey(userId);
+
+        for (int attempt = 0; attempt < MAX_WATCH_RETRIES; attempt++) {
+
+            // WATCH needs a connection of its own until EXEC...
+            try (AbstractTransaction tx = redisClient.transaction(false)) {
+
+                tx.watch(key);
+
+                // ...but the read can use any connection, as long as it happens after the WATCH.
+                UserTable ut = getUser(redisClient, userId);
+
+                if (ut == null) {
+                    tx.unwatch();
+                    shc.incCounter(USER_NOT_FOUND);
+                    msg("User " + userId + " not found");
+                    return null;
+                }
+
+                if (!change.test(ut)) {
+                    tx.unwatch();
+                    return ut;
+                }
+
+                tx.multi();
+                tx.jsonSet(key, Path2.ROOT_PATH, ut.toJson());
+
+                if (tx.exec() != null) {
+                    return ut;
+                }
+
+                shc.incCounter(WATCH_CONFLICT);
+            }
         }
 
-        return ut;
-
+        throw new IllegalStateException("User " + userId + " still changing after " + MAX_WATCH_RETRIES + " attempts");
     }
 
 
@@ -281,149 +350,54 @@ public abstract class BaseChargingDemo {
      * @param mainClient
      * @param deltaProportion
      * @param extraMs
+     * @param threadCount            how many threads to spread the work over
      * @return true if >=90% of requested throughput was achieved.
      * @throws InterruptedException
      */
     protected static boolean runKVBenchmark(int userCount, int tpMs, int durationSeconds, int globalQueryFreqSeconds,
-                                            int jsonsize, JedisPooled mainClient, int deltaProportion, int extraMs)
+                                            int jsonsize, JedisPooled mainClient, int deltaProportion, int extraMs,
+                                            int threadCount)
             throws InterruptedException {
 
-        long lastGlobalQueryMs = 0;
-
-        UserKVState[] userState = new UserKVState[userCount];
-
-        Random r = new Random();
-        Gson gson = new Gson();
-
-        for (int i = 0; i < userCount; i++) {
-            userState[i] = new UserKVState(i, shc);
-        }
+        final int usableThreadCount = getUsableThreadCount(threadCount, tpMs, userCount);
+        final AtomicLong progressCount = new AtomicLong();
 
         final long startMsRun = System.currentTimeMillis();
-        long currentMs = System.currentTimeMillis();
-        int tpThisMs = 0;
-
         final long endtimeMs = System.currentTimeMillis() + (durationSeconds * 1000L);
 
-        // How many transactions we've done...
-        int tranCount = 0;
-        int inFlightCount = 0;
-        int lockCount = 0;
-        int contestedLockCount = 0;
-        int fullUpdate = 0;
-        int deltaUpdate = 0;
+        msg("Running KV benchmark for " + userCount + " users using " + usableThreadCount + " threads");
 
-        int firstSession = Integer.MIN_VALUE;
+        // Keep an eye on one user while we run...
+        final int watchedUser = new Random().nextInt(userCount);
+        ScheduledExecutorService globalQueries = startGlobalQueries(mainClient, watchedUser, userCount,
+                globalQueryFreqSeconds);
 
-        while (endtimeMs > System.currentTimeMillis()) {
+        KVResults results = new KVResults();
 
-            if (tpThisMs++ > tpMs) {
-
-                while (currentMs == System.currentTimeMillis()) {
-                    Thread.sleep(0, 50000);
-
-                }
-
-                sleepExtraMSIfNeeded(extraMs);
-
-                currentMs = System.currentTimeMillis();
-                tpThisMs = 0;
+        try {
+            for (KVResults threadResults : runInThreads(usableThreadCount, threadId -> () ->
+                    runKVWorker(threadId, usableThreadCount, userCount, tpMs, endtimeMs, jsonsize, mainClient,
+                            deltaProportion, extraMs, progressCount))) {
+                results.add(threadResults);
             }
-
-            // Find session to do a transaction for...
-            int oursession = r.nextInt(userCount);
-
-            if (firstSession == Integer.MIN_VALUE) {
-                firstSession = oursession;
-            }
-
-            // See if session already has an active transaction and avoid
-            // it if it does.
-            if (userState[oursession].isTxInFlight()) {
-
-                inFlightCount++;
-
-            } else if (userState[oursession].getUserStatus() == UserKVState.STATUS_LOCKED_BY_SOMEONE_ELSE) {
-
-                if (userState[oursession].getOtherLockTimeMs() + ReferenceData.LOCK_TIMEOUT_MS < System
-                        .currentTimeMillis()) {
-
-                    userState[oursession].startTran();
-                    userState[oursession].setStatus(UserKVState.STATUS_TRYING_TO_LOCK);
-                    GetAndLockUser(mainClient, userState[oursession], oursession, gson);
-                    lockCount++;
-
-                } else {
-                    contestedLockCount++;
-                }
-
-            } else if (userState[oursession].getUserStatus() == UserKVState.STATUS_UNLOCKED) {
-
-                userState[oursession].startTran();
-                userState[oursession].setStatus(UserKVState.STATUS_TRYING_TO_LOCK);
-                GetAndLockUser(mainClient, userState[oursession], oursession, gson);
-                lockCount++;
-
-            } else if (userState[oursession].getUserStatus() == UserKVState.STATUS_LOCKED) {
-
-                userState[oursession].startTran();
-                userState[oursession].setStatus(UserKVState.STATUS_UPDATING);
-
-                if (deltaProportion > r.nextInt(101)) {
-                    deltaUpdate++;
-                    // Instead of sending entire JSON object across wire ask app to update loyalty
-                    // number. For
-                    // large values stored as JSON this can have a dramatic effect on network
-                    // bandwidth
-                    UpdateLockedUser(mainClient, userState[oursession],
-                            userState[oursession].getLockId(), oursession, getNewLoyaltyCardNumber(r) + "",
-                            ExtraUserData.NEW_LOYALTY_NUMBER, gson);
-                } else {
-                    fullUpdate++;
-                    UpdateLockedUser(mainClient, userState[oursession],
-                            userState[oursession].getLockId(), oursession, getExtraUserDataAsObject(jsonsize, gson, r), null, gson);
-                }
-
-            }
-
-            tranCount++;
-            userState[oursession].endTran(); //TODO - Fix when we make async
-
-            if (tranCount % 100000 == 1) {
-                msg("Transaction " + tranCount);
-            }
-
-            // See if we need to do global queries...
-            if (lastGlobalQueryMs + (globalQueryFreqSeconds * 1000L) < System.currentTimeMillis()) {
-                lastGlobalQueryMs = System.currentTimeMillis();
-
-                queryUserAndStats(gson, mainClient, firstSession, userCount);
-
-            }
-
+        } finally {
+            globalQueries.shutdownNow();
         }
 
+        msg(results.tranCount + " transactions done...");
 
-        msg(tranCount + " transactions done...");
-        msg("All entries in queue, waiting for it to drain...");
-        msg("Queue drained...");
-
-        long transactionsPerMs = tranCount / (System.currentTimeMillis() - startMsRun);
+        long transactionsPerMs = results.tranCount / Math.max(1, System.currentTimeMillis() - startMsRun);
         msg("processed " + transactionsPerMs + " entries per ms while doing transactions...");
 
-        long lockFailCount = 0;
-        for (int i = 0; i < userCount; i++) {
-            lockFailCount += userState[i].getLockedBySomeoneElseCount();
-        }
+        msg(results.inFlightCount + " events where a tx was in flight were observed");
+        msg(results.lockCount + " lock attempts");
+        msg(results.contestedLockCount + " contested lock attempts");
+        msg(results.lockFailCount + " lock attempt failures");
+        msg(results.fullUpdate + " full updates");
+        msg(results.deltaUpdate + " delta updates");
+        msg("Retries caused by concurrent changes = " + shc.getCounter(WATCH_CONFLICT));
 
-        msg(inFlightCount + " events where a tx was in flight were observed");
-        msg(lockCount + " lock attempts");
-        msg(contestedLockCount + " contested lock attempts");
-        msg(lockFailCount + " lock attempt failures");
-        msg(fullUpdate + " full updates");
-        msg(deltaUpdate + " delta updates");
-
-        double tps = tranCount;
+        double tps = results.tranCount;
         tps = tps / (System.currentTimeMillis() - startMsRun);
         tps = tps * 1000;
 
@@ -433,72 +407,235 @@ public abstract class BaseChargingDemo {
         return tps / (tpMs * 1000) > .9;
     }
 
-    private static void GetAndLockUser(JedisPooled redisClusterClient, UserKVState userKVState, int sessionId, Gson gson) {
+    /**
+     * One thread's share of the KV benchmark. It owns every user whose id % threadCount == threadId,
+     * so no other thread in this process touches its users.
+     */
+    private static KVResults runKVWorker(int threadId, int threadCount, int userCount, int tpMs, long endtimeMs,
+                                         int jsonsize, JedisPooled mainClient, int deltaProportion, int extraMs,
+                                         AtomicLong progressCount)
+            throws InterruptedException {
+
+        UserKVState[] userState = new UserKVState[getThreadUserCount(userCount, threadCount, threadId)];
+
+        for (int i = 0; i < userState.length; i++) {
+            userState[i] = new UserKVState(i * threadCount + threadId, shc);
+        }
+
+        Random r = new Random();
+        Gson gson = new Gson();
+        TpMsThrottle throttle = new TpMsThrottle(getThreadTpMs(tpMs, threadCount, threadId), extraMs);
+        KVResults results = new KVResults();
+
+        while (endtimeMs > System.currentTimeMillis()) {
+
+            throttle.await();
+
+            // Find session to do a transaction for...
+            UserKVState ourState = userState[r.nextInt(userState.length)];
+            int oursession = ourState.id;
+
+            // See if session already has an active transaction and avoid
+            // it if it does.
+            if (ourState.isTxInFlight()) {
+
+                results.inFlightCount++;
+
+            } else if (ourState.getUserStatus() == UserKVState.STATUS_LOCKED_BY_SOMEONE_ELSE) {
+
+                if (ourState.getOtherLockTimeMs() + ReferenceData.LOCK_TIMEOUT_MS < System
+                        .currentTimeMillis()) {
+
+                    ourState.startTran();
+                    ourState.setStatus(UserKVState.STATUS_TRYING_TO_LOCK);
+                    GetAndLockUser(mainClient, ourState, oursession);
+                    results.lockCount++;
+
+                } else {
+                    results.contestedLockCount++;
+                }
+
+            } else if (ourState.getUserStatus() == UserKVState.STATUS_UNLOCKED) {
+
+                ourState.startTran();
+                ourState.setStatus(UserKVState.STATUS_TRYING_TO_LOCK);
+                GetAndLockUser(mainClient, ourState, oursession);
+                results.lockCount++;
+
+            } else if (ourState.getUserStatus() == UserKVState.STATUS_LOCKED) {
+
+                ourState.startTran();
+                ourState.setStatus(UserKVState.STATUS_UPDATING);
+
+                if (deltaProportion > r.nextInt(101)) {
+                    results.deltaUpdate++;
+                    // Instead of sending entire JSON object across wire ask app to update loyalty
+                    // number. For
+                    // large values stored as JSON this can have a dramatic effect on network
+                    // bandwidth
+                    UpdateLockedUser(mainClient, ourState, ourState.getLockId(), oursession,
+                            getNewLoyaltyCardNumber(r) + "", ExtraUserData.NEW_LOYALTY_NUMBER);
+                } else {
+                    results.fullUpdate++;
+                    UpdateLockedUser(mainClient, ourState, ourState.getLockId(), oursession,
+                            getExtraUserDataAsObject(jsonsize, gson, r), null);
+                }
+
+            }
+
+            results.tranCount++;
+            ourState.endTran(); //TODO - Fix when we make async
+
+            long progress = progressCount.incrementAndGet();
+            if (progress % 100000 == 1) {
+                msg("Transaction " + progress);
+            }
+
+        }
+
+        for (UserKVState state : userState) {
+            results.lockFailCount += state.getLockedBySomeoneElseCount();
+        }
+
+        return results;
+    }
+
+    private static void GetAndLockUser(JedisPooled redisClient, UserKVState userKVState, int sessionId) {
 
         final long startMs = System.currentTimeMillis();
+        final long[] newLockId = {NO_SESSION};
+
         try {
-            UserTable ut = redisClusterClient.jsonGet(getKey(sessionId), UserTable.class);
+            UserTable ut = readModifyWrite(redisClient, sessionId, theUser -> {
+                // lock() returns NO_SESSION if someone else holds an unexpired lock
+                newLockId[0] = theUser.lock();
+                return newLockId[0] != NO_SESSION;
+            });
+
             if (ut == null) {
-                msg("User not found");
+                userKVState.setLockId(NO_SESSION);
+            } else if (newLockId[0] == NO_SESSION) {
+                userKVState.setLockId(NO_SESSION);
+                userKVState.setStatus(UserKVState.STATUS_LOCKED_BY_SOMEONE_ELSE);
+                userKVState.lockedBySomeoneElseCount++;
+                userKVState.otherLockTimeMs = System.currentTimeMillis();
             } else {
-                ut.lock();
-                redisClusterClient.jsonSet(getKey(sessionId), gson.toJson(ut));
-                userKVState.setLockId(ut.userSoftLockSessionId);
+                userKVState.setLockId(newLockId[0]);
             }
 
             shc.reportLatency(BaseChargingDemo.KV_GET, startMs, "KV Get time", 2000);
         } catch (Exception e) {
             e.printStackTrace();
+            userKVState.setLockId(NO_SESSION);
         }
 
 
     }
 
-    private static void UpdateLockedUser(JedisPooled redisClusterClient, UserKVState userKVState, long lockId, int sessionId, Object extraPayload, String deltaOperationName, Gson gson) {
+    private static void UpdateLockedUser(JedisPooled redisClient, UserKVState userKVState, long lockId, int sessionId,
+                                         Object extraPayload, String deltaOperationName) {
 
         final long startMs = System.currentTimeMillis();
 
         try {
-            UserTable ut = redisClusterClient.jsonGet(getKey(sessionId), UserTable.class);
-            if (ut == null) {
-                msg("User not found");
-            } else {
+            readModifyWrite(redisClient, sessionId, ut -> {
+
                 if (ut.isLockedBySomeoneElse(lockId)) {
-                    msg("Locked by someone else");
+                    userKVState.lockedBySomeoneElseCount++;
+                    msg(sessionId + ": locked by someone else");
+                    return false;
                 }
+
                 if (deltaOperationName != null && deltaOperationName.equals(ExtraUserData.NEW_LOYALTY_NUMBER)) {
                     ut.userDataObject.loyaltySchemeNumber = Long.parseLong((String) extraPayload);
                 } else {
                     ut.setUserDataObject((ExtraUserData) extraPayload);
                 }
 
-                redisClusterClient.jsonSet(getKey(sessionId), gson.toJson(ut));
-                userKVState.setLockId(NO_SESSION);
-
-            }
+                ut.unLock();
+                return true;
+            });
 
             shc.reportLatency(BaseChargingDemo.KV_PUT, startMs, "KV Put time", 2000);
         } catch (Exception e) {
             e.printStackTrace();
         }
 
+        userKVState.setLockId(NO_SESSION);
 
     }
 
     /**
-     * Used when we need to really slow down below 1 tx per ms..
+     * Run one worker per thread and wait for them all to finish.
      *
-     * @param extraMs an arbitrary extra delay.
+     * @param threadCount     how many threads
+     * @param workerForThread given a thread id, returns the work for that thread
+     * @return each thread's result, in thread id order
      */
-    private static void sleepExtraMSIfNeeded(int extraMs) {
-        if (extraMs > 0) {
-            try {
-                Thread.sleep(extraMs);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }
+    protected static <T> List<T> runInThreads(int threadCount, IntFunction<Callable<T>> workerForThread)
+            throws InterruptedException {
 
+        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+
+        try {
+            List<Callable<T>> workers = new ArrayList<>(threadCount);
+            for (int threadId = 0; threadId < threadCount; threadId++) {
+                workers.add(workerForThread.apply(threadId));
+            }
+
+            List<T> results = new ArrayList<>(threadCount);
+            for (Future<T> future : pool.invokeAll(workers)) {
+                try {
+                    results.add(future.get());
+                } catch (ExecutionException e) {
+                    throw new RuntimeException(e.getCause());
+                }
+            }
+            return results;
+
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * Each thread needs at least one tx per ms and one user to work with.
+     */
+    protected static int getUsableThreadCount(int threadCount, int tpMs, int userCount) {
+        return Math.max(1, Math.min(threadCount, Math.min(tpMs, userCount)));
+    }
+
+    /**
+     * @return threadId's share of tpMs
+     */
+    private static int getThreadTpMs(int tpMs, int threadCount, int threadId) {
+        return tpMs / threadCount + (threadId < tpMs % threadCount ? 1 : 0);
+    }
+
+    /**
+     * @return how many users have id % threadCount == threadId
+     */
+    private static int getThreadUserCount(int userCount, int threadCount, int threadId) {
+        return (userCount - threadId + threadCount - 1) / threadCount;
+    }
+
+    /**
+     * Report on one user and global stats every freqSeconds, on a thread of its own so the
+     * workers aren't held up.
+     */
+    private static ScheduledExecutorService startGlobalQueries(JedisPooled redisClient, int queryUserId,
+                                                               int userCount, int freqSeconds) {
+
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                queryUserAndStats(redisClient, queryUserId, userCount);
+            } catch (Exception e) {
+                msg("Global query failed: " + e.getMessage());
+            }
+        }, freqSeconds, Math.max(1, freqSeconds), TimeUnit.SECONDS);
+
+        return scheduler;
     }
 
     /**
@@ -506,34 +643,29 @@ public abstract class BaseChargingDemo {
      * credit.
      *
      */
-    protected static void clearUnfinishedTransactions(JedisPooled redisClusterClient, int usercount, Gson g)
+    protected static void clearUnfinishedTransactions(JedisPooled redisClient, int userCount, int threadCount)
             throws Exception {
 
         msg("clearUnfinishedTransactions...");
-        for (int id = 0; id < usercount; id++) {
+        final long startMs = System.currentTimeMillis();
+        final int usableThreadCount = getUsableThreadCount(threadCount, Integer.MAX_VALUE, userCount);
 
-            final long startMs = System.currentTimeMillis();
-
-            try {
-                UserTable ut = redisClusterClient.jsonGet(getKey(id), UserTable.class);
-                if (ut == null) {
-                    msg("User not found");
-                } else {
-
-                    if (ut.clearSessions() > 0) {
-                        redisClusterClient.jsonSet(getKey(id), g.toJson(ut));
+        runInThreads(usableThreadCount, threadId -> () -> {
+            for (int id = threadId; id < userCount; id += usableThreadCount) {
+                try {
+                    // Most users won't need changing, so check cheaply before paying for WATCH/MULTI/EXEC
+                    UserTable ut = getUser(redisClient, id);
+                    if (ut != null && ut.getUserUsageCount() > 0) {
+                        readModifyWrite(redisClient, id, theUser -> theUser.clearSessions() > 0);
                     }
-
-
+                } catch (Exception e) {
+                    e.printStackTrace();
                 }
-
-                shc.reportLatency(BaseChargingDemo.CLEAR_UNFINISHED, startMs, "clear unfinished", 2000);
-            } catch (
-                    Exception e) {
-                e.printStackTrace();
             }
-        }
+            return null;
+        });
 
+        shc.reportLatency(BaseChargingDemo.CLEAR_UNFINISHED, startMs, "clear unfinished", 2000);
         msg("...done");
 
     }
@@ -542,41 +674,44 @@ public abstract class BaseChargingDemo {
      *
      * Convenience method to clear outstanding locks between runs
      *
-     * @param redisClusterClient
+     * @param redisClient
      */
-    protected static void unlockAllRecords(JedisPooled redisClusterClient, int usercount, Gson g) {
+    protected static void unlockAllRecords(JedisPooled redisClient, int userCount, int threadCount)
+            throws InterruptedException {
 
         msg("Clearing locked sessions from prior runs...");
-        for (int id = 0; id < usercount; id++) {
+        final long startMs = System.currentTimeMillis();
+        final int usableThreadCount = getUsableThreadCount(threadCount, Integer.MAX_VALUE, userCount);
 
-            final long startMs = System.currentTimeMillis();
-
-            try {
-                UserTable ut = redisClusterClient.jsonGet(getKey(id), UserTable.class);
-                if (ut == null) {
-                    msg("User not found");
-                } else {
-
-                    if (ut.userSoftlockExpiry != NO_EXPIRY || ut.userSoftLockSessionId != NO_SESSION) {
-                        ut.userSoftlockExpiry = NO_EXPIRY;
-                        ut.userSoftLockSessionId = NO_SESSION;
-
-                        redisClusterClient.jsonSet(getKey(id), g.toJson(ut));
-                        shc.reportLatency(BaseChargingDemo.CLEAR_LOCK, startMs, "clear unfinished", 2000);
+        runInThreads(usableThreadCount, threadId -> () -> {
+            for (int id = threadId; id < userCount; id += usableThreadCount) {
+                try {
+                    // Most users won't be locked, so check cheaply before paying for WATCH/MULTI/EXEC
+                    UserTable ut = getUser(redisClient, id);
+                    if (ut != null && isLocked(ut)) {
+                        readModifyWrite(redisClient, id, theUser -> {
+                            if (!isLocked(theUser)) {
+                                return false;
+                            }
+                            theUser.unLock();
+                            return true;
+                        });
                     }
-
+                } catch (Exception e) {
+                    e.printStackTrace();
                 }
-
-
-            } catch (
-                    Exception e) {
-                e.printStackTrace();
             }
-        }
+            return null;
+        });
 
-
+        shc.reportLatency(BaseChargingDemo.CLEAR_LOCK, startMs, "clear locks", 2000);
         msg("...done");
 
+    }
+
+
+    private static boolean isLocked(UserTable ut) {
+        return ut.userSoftlockExpiry != null || ut.userSoftLockSessionId != NO_SESSION;
     }
 
 
@@ -590,126 +725,50 @@ public abstract class BaseChargingDemo {
      * @param globalQueryFreqSeconds how often we check on global stats and a single
      *                               user
      * @param mainClient
+     * @param threadCount            how many threads to spread the work over
      * @return true if within 90% of targeted TPS
      * @throws InterruptedException
      */
     protected static boolean runTransactionBenchmark(int userCount, int tpMs, int durationSeconds,
-                                                     int globalQueryFreqSeconds, JedisPooled mainClient, JedisPooled otherClient, int extraMs)
+                                                     int globalQueryFreqSeconds, JedisPooled mainClient, int extraMs,
+                                                     int threadCount)
             throws InterruptedException {
 
-        Gson g = new Gson();
-
-        // Used to track changes and be unique when we are running multiple threads
-        final long pid = getPid();
-
-        Random r = new Random();
-
-        UserTransactionState[] users = new UserTransactionState[userCount];
-
-        msg("Creating internal client records for " + users.length + " users");
-        for (int i = 0; i < users.length; i++) {
-            // We don't know a users credit till we've spoken to the server, so
-            // we make an optimistic assumption...
-            users[i] = new UserTransactionState(i, 2000);
-        }
+        final int usableThreadCount = getUsableThreadCount(threadCount, tpMs, userCount);
+        final AtomicLong progressCount = new AtomicLong();
 
         final long startMsRun = System.currentTimeMillis();
-        long currentMs = System.currentTimeMillis();
-        int tpThisMs = 0;
-
         final long endtimeMs = System.currentTimeMillis() + (durationSeconds * 1000L);
 
-        // How many transactions we've done...
-        long tranCount = 0;
-        long inFlightCount = 0;
-        long addCreditCount = 0;
-        long reportUsageCount = 0;
-        long lastGlobalQueryMs = System.currentTimeMillis();
+        msg("starting " + usableThreadCount + " threads for " + userCount + " users...");
 
-        msg("starting...");
+        ScheduledExecutorService globalQueries = startGlobalQueries(mainClient, (int) GENERIC_QUERY_USER_ID,
+                userCount, globalQueryFreqSeconds);
 
-        while (endtimeMs > System.currentTimeMillis()) {
+        TransactionResults results = new TransactionResults();
 
-            if (tpThisMs++ > tpMs) {
-
-                while (currentMs == System.currentTimeMillis()) {
-                    Thread.sleep(0, 50000);
-
-                }
-
-                sleepExtraMSIfNeeded(extraMs);
-
-                currentMs = System.currentTimeMillis();
-                tpThisMs = 0;
+        try {
+            for (TransactionResults threadResults : runInThreads(usableThreadCount, threadId -> () ->
+                    runTransactionWorker(threadId, usableThreadCount, userCount, tpMs, endtimeMs, mainClient, extraMs,
+                            progressCount))) {
+                results.add(threadResults);
             }
-
-            int randomuser = r.nextInt(userCount);
-
-            if (users[randomuser].isTxInFlight()) {
-                inFlightCount++;
-            } else {
-
-                users[randomuser].startTran();
-
-                if (users[randomuser].spendableBalance < 1000) {
-
-                    addCreditCount++;
-
-                    final long extraCredit = r.nextInt(1000) + 1000;
-
-                    final long startMs = System.currentTimeMillis();
-                    addCredit(mainClient, randomuser, extraCredit, g);
-                    shc.reportLatency(BaseChargingDemo.ADD_CREDIT, startMs, "ADD_CREDIT", 2000);
-                    shc.incCounter(BaseChargingDemo.ADD_CREDIT);
-                    users[randomuser].endTran();
-                    users[randomuser].spendableBalance += extraCredit;
-
-
-                } else {
-
-                    reportUsageCount++;
-
-                    int unitsUsed = (int) (users[randomuser].currentlyReserved * 0.9);
-                    int unitsWanted = r.nextInt(100);
-                    final long startMs = System.currentTimeMillis();
-                    reportQuotaUsage(mainClient, randomuser, unitsUsed,
-                            unitsWanted, users[randomuser].sessionId,
-                            "ReportQuotaUsage_" + pid + "_" + reportUsageCount + "_" + System.currentTimeMillis(), g, users[randomuser]);
-                    shc.reportLatency(BaseChargingDemo.REPORT_QUOTA_USAGE, startMs, "REPORT_QUOTA_USAGE", 2000);
-                    shc.incCounter(BaseChargingDemo.REPORT_QUOTA_USAGE);
-                    users[randomuser].endTran();
-
-                }
-            }
-
-            if (tranCount++ % 100000 == 0) {
-                msg("On transaction #" + tranCount);
-            }
-
-            // See if we need to do global queries...
-            if (lastGlobalQueryMs + (globalQueryFreqSeconds * 1000L) < System.currentTimeMillis()) {
-                lastGlobalQueryMs = System.currentTimeMillis();
-
-                queryUserAndStats(g, mainClient, (int) GENERIC_QUERY_USER_ID, userCount);
-
-            }
-
+        } finally {
+            globalQueries.shutdownNow();
         }
 
-        msg("finished adding transactions to queue");
-        msg("Queue drained");
-
         long elapsedTimeMs = System.currentTimeMillis() - startMsRun;
-        msg("Processed " + tranCount + " transactions in " + elapsedTimeMs + " milliseconds");
+        msg("Processed " + results.tranCount + " transactions in " + elapsedTimeMs + " milliseconds");
 
-        double tps = tranCount;
-        tps = tps / (elapsedTimeMs / 1000);
+        double tps = results.tranCount;
+        tps = tps / (elapsedTimeMs / 1000d);
 
         msg("TPS = " + tps);
 
-        msg("Add Credit calls = " + addCreditCount);
-        msg("Report Usage calls = " + reportUsageCount);
-        msg("Skipped because transaction was in flight = " + inFlightCount);
+        msg("Add Credit calls = " + results.addCreditCount);
+        msg("Report Usage calls = " + results.reportUsageCount);
+        msg("Skipped because transaction was in flight = " + results.inFlightCount);
+        msg("Retries caused by concurrent changes = " + shc.getCounter(WATCH_CONFLICT));
 
         reportRunLatencyStats(tpMs, tps);
 
@@ -717,24 +776,140 @@ public abstract class BaseChargingDemo {
         return tps / (tpMs * 1000) > .9;
     }
 
+    /**
+     * One thread's share of the transaction benchmark. It owns every user whose id % threadCount == threadId,
+     * so no other thread in this process touches its users.
+     */
+    private static TransactionResults runTransactionWorker(int threadId, int threadCount, int userCount, int tpMs,
+                                                           long endtimeMs, JedisPooled mainClient, int extraMs,
+                                                           AtomicLong progressCount)
+            throws InterruptedException {
 
-    private static void addCredit(JedisPooled redisClusterClient, int sessionId, long extraCredit, Gson g) {
+        // Used to track changes and be unique when we are running multiple threads
+        final String txnPrefix = "ReportQuotaUsage_" + getPid() + "_" + threadId + "_";
 
-        final long startMs = System.currentTimeMillis();
-        final String txnId = "AC" + startMs;
+        Random r = new Random();
 
-        try {
-            UserTable ut = redisClusterClient.jsonGet(getKey(sessionId), UserTable.class);
-            if (ut == null) {
-                msg("User not found");
+        UserTransactionState[] users = new UserTransactionState[getThreadUserCount(userCount, threadCount, threadId)];
+
+        for (int i = 0; i < users.length; i++) {
+            // We don't know a users credit till we've spoken to the server, so
+            // we make an optimistic assumption...
+            users[i] = new UserTransactionState(i * threadCount + threadId, 2000);
+        }
+
+        TpMsThrottle throttle = new TpMsThrottle(getThreadTpMs(tpMs, threadCount, threadId), extraMs);
+        TransactionResults results = new TransactionResults();
+
+        while (endtimeMs > System.currentTimeMillis()) {
+
+            throttle.await();
+
+            UserTransactionState user = users[r.nextInt(users.length)];
+
+            if (user.isTxInFlight()) {
+                results.inFlightCount++;
             } else {
 
+                user.startTran();
 
-                ut.addCredit(extraCredit, txnId);
+                if (user.spendableBalance < 1000) {
 
-                redisClusterClient.jsonSet(getKey(sessionId), g.toJson(ut));
+                    results.addCreditCount++;
+
+                    final long extraCredit = r.nextInt(1000) + 1000;
+
+                    final long startMs = System.currentTimeMillis();
+                    addCredit(mainClient, user.id, extraCredit, user);
+                    shc.reportLatency(BaseChargingDemo.ADD_CREDIT, startMs, "ADD_CREDIT", 2000);
+                    shc.incCounter(BaseChargingDemo.ADD_CREDIT);
+                    user.endTran();
+
+
+                } else {
+
+                    results.reportUsageCount++;
+
+                    int unitsUsed = (int) (user.currentlyReserved * 0.9);
+                    int unitsWanted = r.nextInt(100);
+                    final long startMs = System.currentTimeMillis();
+                    reportQuotaUsage(mainClient, user.id, unitsUsed, unitsWanted, user.sessionId,
+                            txnPrefix + results.reportUsageCount + "_" + System.currentTimeMillis(), user);
+                    shc.reportLatency(BaseChargingDemo.REPORT_QUOTA_USAGE, startMs, "REPORT_QUOTA_USAGE", 2000);
+                    shc.incCounter(BaseChargingDemo.REPORT_QUOTA_USAGE);
+                    user.endTran();
+
+                }
+            }
+
+            results.tranCount++;
+
+            long progress = progressCount.incrementAndGet();
+            if (progress % 100000 == 1) {
+                msg("On transaction #" + progress);
+            }
+
+        }
+
+        return results;
+    }
+
+    /**
+     * Counters from one KV benchmark thread
+     */
+    private static class KVResults {
+        long tranCount = 0;
+        long inFlightCount = 0;
+        long lockCount = 0;
+        long contestedLockCount = 0;
+        long lockFailCount = 0;
+        long fullUpdate = 0;
+        long deltaUpdate = 0;
+
+        void add(KVResults other) {
+            tranCount += other.tranCount;
+            inFlightCount += other.inFlightCount;
+            lockCount += other.lockCount;
+            contestedLockCount += other.contestedLockCount;
+            lockFailCount += other.lockFailCount;
+            fullUpdate += other.fullUpdate;
+            deltaUpdate += other.deltaUpdate;
+        }
+    }
+
+    /**
+     * Counters from one transaction benchmark thread
+     */
+    private static class TransactionResults {
+        long tranCount = 0;
+        long inFlightCount = 0;
+        long addCreditCount = 0;
+        long reportUsageCount = 0;
+
+        void add(TransactionResults other) {
+            tranCount += other.tranCount;
+            inFlightCount += other.inFlightCount;
+            addCreditCount += other.addCreditCount;
+            reportUsageCount += other.reportUsageCount;
+        }
+    }
+
+
+    private static void addCredit(JedisPooled redisClient, int sessionId, long extraCredit,
+                                  UserTransactionState userTransactionState) {
+
+        final long startMs = System.currentTimeMillis();
+        final String txnId = "AC_" + getPid() + "_" + sessionId + "_" + System.nanoTime();
+
+        try {
+            UserTable ut = readModifyWrite(redisClient, sessionId, theUser -> {
+                theUser.addCredit(extraCredit, txnId);
+                return true;
+            });
+
+            if (ut != null) {
+                userTransactionState.spendableBalance = ut.getAvailableCredit();
                 shc.reportLatency(BaseChargingDemo.KV_PUT, startMs, "KV Put time", 2000);
-
             }
 
         } catch (Exception e) {
@@ -743,24 +918,24 @@ public abstract class BaseChargingDemo {
     }
 
 
-    private static void reportQuotaUsage(JedisPooled redisClusterClient
+    private static void reportQuotaUsage(JedisPooled redisClient
             , int randomuser, int unitsUsed, int unitsWanted, long sessionId
-            , String txnId, Gson gson, UserTransactionState userTransactionStateState) {
+            , String txnId, UserTransactionState userTransactionState) {
 
 
         final long startMs = System.currentTimeMillis();
 
         try {
-            UserTable ut = redisClusterClient.jsonGet(getKey(randomuser), UserTable.class);
-            if (ut == null) {
-                msg("User not found");
-            } else {
+            UserTable ut = readModifyWrite(redisClient, randomuser, theUser -> {
+                theUser.reportQuotaUsage(unitsUsed, unitsWanted, sessionId, txnId);
+                return true;
+            });
 
-                ut.reportQuotaUsage(unitsUsed, unitsWanted, sessionId, txnId);
-                redisClusterClient.jsonSet(getKey((int) sessionId), gson.toJson(ut));
-                userTransactionStateState.endTran();
+            if (ut != null) {
+                userTransactionState.spendableBalance = ut.getAvailableCredit();
+                UserUsageTable reservation = ut.getUserUsage(sessionId);
+                userTransactionState.currentlyReserved = reservation == null ? 0 : reservation.allocatedAmount;
                 shc.reportLatency(BaseChargingDemo.KV_PUT, startMs, "KV Put time", 2000);
-
             }
 
         } catch (Exception e) {
@@ -815,6 +990,22 @@ public abstract class BaseChargingDemo {
     }
 
     /**
+     * Get the optional thread count argument.
+     *
+     * @param args  command line
+     * @param index where the thread count would be
+     * @return thread count, or the number of CPUs if not given
+     */
+    public static int getThreadCount(String[] args, int index) {
+
+        if (args.length > index) {
+            return Integer.parseInt(args[index]);
+        }
+
+        return Runtime.getRuntime().availableProcessors();
+    }
+
+    /**
      * get EXTRA_MS env variable if set
      *
      * @return extraMs
@@ -834,16 +1025,19 @@ public abstract class BaseChargingDemo {
     }
 
 
-    private static JedisPoolConfig buildPoolConfig() {
-        final JedisPoolConfig poolConfig = new JedisPoolConfig();
-        poolConfig.setMaxTotal(128);
-        poolConfig.setMaxIdle(128);
+    /**
+     * Each thread can hold two connections at once - one for WATCH/MULTI/EXEC and one for the read -
+     * plus one for global queries.
+     */
+    private static ConnectionPoolConfig buildPoolConfig(int threadCount) {
+        final ConnectionPoolConfig poolConfig = new ConnectionPoolConfig();
+        final int maxConnections = Math.max(128, threadCount * 2 + 2);
+        poolConfig.setMaxTotal(maxConnections);
+        poolConfig.setMaxIdle(maxConnections);
         poolConfig.setMinIdle(16);
-        poolConfig.setTestOnBorrow(true);
-        poolConfig.setTestOnReturn(true);
         poolConfig.setTestWhileIdle(true);
-        poolConfig.setMinEvictableIdleTimeMillis(Duration.ofSeconds(60).toMillis());
-        poolConfig.setTimeBetweenEvictionRunsMillis(Duration.ofSeconds(30).toMillis());
+        poolConfig.setMinEvictableIdleDuration(Duration.ofSeconds(60));
+        poolConfig.setTimeBetweenEvictionRuns(Duration.ofSeconds(30));
         poolConfig.setNumTestsPerEvictionRun(3);
         poolConfig.setBlockWhenExhausted(true);
         return poolConfig;

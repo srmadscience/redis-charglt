@@ -9,18 +9,18 @@
 package ie.rolfe.redischarglt.documents;
 
 import com.google.gson.Gson;
-import com.google.gson.internal.LinkedTreeMap;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonDeserializer;
+import com.google.gson.JsonPrimitive;
+import com.google.gson.JsonSerializer;
 import ie.rolfe.redischarglt.ReferenceData;
 
 import java.security.SecureRandom;
-import java.text.ParseException;
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 
-import static ie.rolfe.redischarglt.BaseChargingDemo.msg;
 
 /**
  * CREATE table user_table
@@ -38,8 +38,15 @@ public class UserTable {
     public static final String ADDED_BY_TXN = " added by Txn ";
     public static final String ALREADY_HAPPENED = " already happened";
     public static long TX_KEEP_MS = 300000;
-    public static final String GOOGLE_GSON_DATE_FORMAT = "MMM dd, yyyy, KK:mm:ss a"; // "Feb 3, 2026, 2:54:21"
-    static SimpleDateFormat sdf = new SimpleDateFormat(GOOGLE_GSON_DATE_FORMAT);
+
+    /**
+     * Dates are stored as epoch ms. Gson's default date format depends on the JVM's locale, so documents
+     * written by one JVM can't always be read by another.
+     */
+    public static final Gson GSON = new GsonBuilder()
+            .registerTypeAdapter(Date.class, (JsonSerializer<Date>) (src, typeOfSrc, context) -> new JsonPrimitive(src.getTime()))
+            .registerTypeAdapter(Date.class, (JsonDeserializer<Date>) (json, typeOfT, context) -> new Date(json.getAsLong()))
+            .create();
 
     public long _id;
 
@@ -65,8 +72,15 @@ public class UserTable {
 
     }
 
-    public static UserTable fromJson(Gson gson, String document) {
-        return new Gson().fromJson(document, UserTable.class);
+    public static UserTable fromJson(String document) {
+        if (document == null) {
+            return null;
+        }
+        return GSON.fromJson(document, UserTable.class);
+    }
+
+    public String toJson() {
+        return GSON.toJson(this, UserTable.class);
     }
 
     public static UserTable getUserTable(ExtraUserData eud, long initialCredit, long id, long startMsUpsert) {
@@ -81,57 +95,6 @@ public class UserTable {
         newUser.addUserRecentTransaction(urt);
 
         return newUser;
-    }
-
-    public static UserTable fromLTM(Gson g, com.google.gson.internal.LinkedTreeMap userDoc) {
-
-        UserTable ut = new UserTable();
-
-        ut._id = (long) ((double) userDoc.get("_id"));
-        ut.userId = (long) ((double) userDoc.get("userId"));
-
-        ExtraUserData eud = new ExtraUserData();
-        com.google.gson.internal.LinkedTreeMap eut = (LinkedTreeMap) userDoc.get("userDataObject");
-
-        eud.loyaltySchemeName = eut.get("loyaltySchemeName").toString();
-        eud.loyaltySchemeNumber = (long) ((double) eut.get("loyaltySchemeNumber"));
-        eud.mysteriousHexPayload = eut.get("mysteriousHexPayload").toString();
-        ut.userDataObject = eud;
-
-        try {
-            ut.userLastSeen = getDateFromLTM(userDoc.get("userLastSeen"));
-
-        } catch (ParseException e) {
-            throw new RuntimeException(e);
-        }
-        ut.userSoftLockSessionId = (long) ((double) userDoc.get("userSoftLockSessionId"));
-        try {
-            ut.userSoftlockExpiry = getDateFromLTM(userDoc.get("userSoftlockExpiry"));
-        } catch (ParseException e) {
-            throw new RuntimeException(e);
-        }
-        ut.balance = (long) ((double) userDoc.get("balance"));
-
-        com.google.gson.internal.LinkedTreeMap urt = (LinkedTreeMap) userDoc.get("userRecentTransactions");
-        for (Object value : urt.values()) {
-            ut.userRecentTransactions.put((((LinkedTreeMap) value).get("userTxnId").toString())
-                    , UserRecentTransactions.fromLTM(g, (LinkedTreeMap) value));
-        }
-        com.google.gson.internal.LinkedTreeMap uus = (LinkedTreeMap) userDoc.get("userUsage");
-        for (Object value : uus.values()) {
-            ut.userUsage.put((long) ((double) ((LinkedTreeMap) value).get("sessionId"))
-                    , UserUsageTable.fromLTM(g, (LinkedTreeMap) value));
-        }
-
-
-        return ut;
-    }
-
-    public static Date getDateFromLTM(Object userDoc) throws ParseException {
-        if (userDoc == null) {
-            return null;
-        }
-        return sdf.parse(userDoc.toString().replace("PM", "p.m.").replace("AM", "a.m."));
     }
 
     public void setUserDataObject(ExtraUserData userDataObject) {

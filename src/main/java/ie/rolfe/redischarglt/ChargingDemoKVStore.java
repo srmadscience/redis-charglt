@@ -16,14 +16,10 @@
 package ie.rolfe.redischarglt;
 
 
-import com.google.gson.Gson;
-import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.JedisPooled;
 
 
 import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
 
 public class ChargingDemoKVStore extends BaseChargingDemo {
 
@@ -35,8 +31,8 @@ public class ChargingDemoKVStore extends BaseChargingDemo {
 
         msg("Parameters:" + Arrays.toString(args));
 
-        if (args.length != 7) {
-            msg("Usage: hostnames recordcount tpms durationseconds queryseconds jsonsize deltaProportion");
+        if (args.length != 7 && args.length != 8) {
+            msg("Usage: hostnames recordcount tpms durationseconds queryseconds jsonsize deltaProportion [threads]");
             System.exit(1);
         }
 
@@ -48,6 +44,9 @@ public class ChargingDemoKVStore extends BaseChargingDemo {
 
         // Target transactions per millisecond.
         int tpMs = Integer.parseInt(args[2]);
+
+        // How many threads. Defaults to the number of CPUs.
+        int threadCount = getThreadCount(args, 7);
 
         // Runtime for TRANSACTIONS in seconds.
         int durationSeconds = Integer.parseInt(args[3]);
@@ -65,10 +64,10 @@ public class ChargingDemoKVStore extends BaseChargingDemo {
 
         boolean ok = true;
         try {
-            try (JedisPooled jedisPool = new JedisPooled(hosts[0],REDIS_DEFAULT_PORT)) {
-                unlockAllRecords(jedisPool, userCount, new Gson());
+            try (JedisPooled jedisPool = connect(hosts[0], threadCount)) {
+                unlockAllRecords(jedisPool, userCount, threadCount);
                  ok = runKVBenchmark(userCount, tpMs, durationSeconds, globalQueryFreqSeconds, jsonsize, jedisPool,
-                        deltaProportion, extraMs);
+                        deltaProportion, extraMs, threadCount);
             }
 
 

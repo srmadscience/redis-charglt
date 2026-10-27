@@ -11,10 +11,8 @@ package ie.rolfe.redischarglt.documents;
 
 import com.google.gson.Gson;
 
-import java.text.ParseException;
 import java.util.Date;
 
-import static ie.rolfe.redischarglt.documents.UserTable.getDateFromLTM;
 
 /**
  * create table user_recent_transactions
@@ -66,24 +64,6 @@ public class UserRecentTransactions {
 
     public static UserRecentTransactions fromJson(Gson gson, String document) {
         return new Gson().fromJson(document, UserRecentTransactions.class);
-    }
-
-    public static UserRecentTransactions fromLTM(Gson g, com.google.gson.internal.LinkedTreeMap userDoc) {
-        UserRecentTransactions urt = new UserRecentTransactions();
-
-        urt.userTxnId = (String) userDoc.get("userTxnId");
-        urt.userId = (long) ((double) userDoc.get("userId"));
-        urt.approvedAmount = (long) ((double) userDoc.get("approvedAmount"));
-        urt.purpose = (String) userDoc.get("purpose");
-        urt.sessionId = (long) ((double) userDoc.get("sessionId"));
-        urt.spentAmount = (long) ((double) userDoc.get("spentAmount"));
-        try {
-            urt.txnTime = UserTable.getDateFromLTM(userDoc.get("txnTime"));
-
-        } catch (ParseException e) {
-            throw new RuntimeException(e);
-        }
-        return urt;
     }
 
     @Override
